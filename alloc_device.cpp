@@ -130,6 +130,19 @@ static int gralloc_alloc_framebuffer(alloc_device_t* dev, size_t size, int usage
 }
 
 /*
+ * Type of allocation
+ */
+enum AllocType
+{
+	UNCOMPRESSED = 0,
+	AFBC,
+
+	/* AN AFBC buffer with additional padding to ensure a 64-bte alignment
+	 * for each row of blocks in the header */
+	AFBC_PADDED
+};
+
+/*
  * Computes the strides and size for an RGB buffer
  *
  * width               width of the buffer in pixels
@@ -139,10 +152,10 @@ static int gralloc_alloc_framebuffer(alloc_device_t* dev, size_t size, int usage
  * pixel_stride (out)  stride of the buffer in pixels
  * byte_stride  (out)  stride of the buffer in bytes
  * size         (out)  size of the buffer in bytes
- * afbc         (in)   if buffer should be allocated for afbc
+ * type         (in)   if buffer should be allocated for afbc
  */
 static void get_rgb_stride_and_size(int width, int height, int pixel_size,
-                                    int* pixel_stride, int* byte_stride, size_t* size, bool afbc)
+                                    int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
 {
 	int stride;
 
@@ -167,10 +180,20 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
 		*pixel_stride = stride / pixel_size;
 	}
 
-	if (afbc)
+	if (type != UNCOMPRESSED)
 	{
-		int w_aligned = GRALLOC_ALIGN( width, AFBC_PIXELS_PER_BLOCK );
+		int w_aligned;
 		int h_aligned = GRALLOC_ALIGN( height, AFBC_PIXELS_PER_BLOCK );
+
+		if (type == AFBC_PADDED)
+		{
+			w_aligned = GRALLOC_ALIGN( width, 64 );
+		}
+		else
+		{
+			w_aligned = GRALLOC_ALIGN( width, AFBC_PIXELS_PER_BLOCK );
+		}
+
 		int nblocks = w_aligned / AFBC_PIXELS_PER_BLOCK * h_aligned / AFBC_PIXELS_PER_BLOCK;
 
 		if ( size != NULL )
@@ -190,10 +213,10 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
  * pixel_stride (out)  stride of the buffer in pixels
  * byte_stride  (out)  stride of the buffer in bytes
  * size         (out)  size of the buffer in bytes
- * afbc         (in)   if buffer should be allocated for afbc
+ * type         (in)   if buffer should be allocated for afbc
  */
 static bool get_yv12_stride_and_size(int width, int height,
-                                     int* pixel_stride, int* byte_stride, size_t* size, bool afbc)
+                                     int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
 {
 	int luma_stride;
 
@@ -203,8 +226,14 @@ static bool get_yv12_stride_and_size(int width, int height,
 		return false;
 	}
 
-	if ( afbc && size != NULL )
+	if (type != UNCOMPRESSED && size != NULL)
 	{
+		if (type == AFBC_PADDED)
+		{
+			AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
+			return false;
+		}
+
 		width = GRALLOC_ALIGN( width, AFBC_PIXELS_PER_BLOCK );
 		height = GRALLOC_ALIGN( height, AFBC_PIXELS_PER_BLOCK );
 	}
@@ -229,7 +258,7 @@ static bool get_yv12_stride_and_size(int width, int height,
 		*pixel_stride = luma_stride;
 	}
 
-	if ( afbc && size != NULL )
+	if ( type != UNCOMPRESSED && size != NULL )
 	{
 		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
 
@@ -240,8 +269,244 @@ static bool get_yv12_stride_and_size(int width, int height,
 	return true;
 }
 
+/*
+ * Calculate strides and sizes for a P010 (Y-UV 4:2:0) or P210 (Y-UV 4:2:2) buffer.
+ *
+ * @param width         [in]    Buffer width.
+ * @param height        [in]    Buffer height.
+ * @param vss           [in]    Vertical sub-sampling factor (2 for P010, 1 for
+ *                              P210. Anything else is invalid).
+ * @param pixel_stride  [out]   Pixel stride; number of pixels between
+ *                              consecutive rows.
+ * @param byte_stride   [out]   Byte stride; number of bytes between
+ *                              consecutive rows.
+ * @param size          [out]   Size of the buffer in bytes. Cumulative sum of
+ *                              sizes of all planes.
+ *
+ * @return true if the calculation was successful; false otherwise (invalid
+ * parameter)
+ */
+static bool get_yuv_pX10_stride_and_size(int width, int height, int vss, int* pixel_stride, int* byte_stride, size_t* size)
+{
+	int luma_pixel_stride, luma_byte_stride;
+
+	if (vss < 1 || vss > 2)
+	{
+		AERR("Invalid vertical sub-sampling factor: %d, should be 1 or 2", vss);
+		return false;
+	}
+
+	/* odd height is allowed for P210 (2x1 sub-sampling) */
+	if ((width & 1) || (vss == 2 && (height & 1)))
+	{
+		return false;
+	}
+
+	luma_pixel_stride = GRALLOC_ALIGN(width, 16);
+	luma_byte_stride  = GRALLOC_ALIGN(width * 2, 16);
+
+	if (size != NULL)
+	{
+		int chroma_size = GRALLOC_ALIGN(width * 2, 16) * (height / vss);
+		*size = luma_byte_stride * height + chroma_size;
+	}
+
+	if (byte_stride != NULL)
+	{
+		*byte_stride = luma_byte_stride;
+	}
+
+	if (pixel_stride != NULL)
+	{
+		*pixel_stride = luma_pixel_stride;
+	}
+
+	return true;
+}
+
+/*
+ *  Calculate strides and strides for Y210 (YUYV packed, 4:2:2) format buffer.
+ *
+ * @param width         [in]    Buffer width.
+ * @param height        [in]    Buffer height.
+ * @param pixel_stride  [out]   Pixel stride; number of pixels between
+ *                              consecutive rows.
+ * @param byte_stride   [out]   Byte stride; number of bytes between
+ *                              consecutive rows.
+ * @param size          [out]   Size of the buffer in bytes. Cumulative sum of
+ *                              sizes of all planes.
+ *
+ * @return true if the calculation was successful; false otherwise (invalid
+ * parameter)
+ */
+static bool get_yuv_y210_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+{
+	int y210_byte_stride, y210_pixel_stride;
+
+	if (width & 1)
+	{
+		return false;
+	}
+
+	y210_pixel_stride = GRALLOC_ALIGN(width, 16);
+	y210_byte_stride  = GRALLOC_ALIGN(width * 4, 16);
+
+	if (size != NULL)
+	{
+		/* 4x16bits per pixel */
+		*size = y210_byte_stride * height;
+	}
+
+	if (byte_stride != NULL)
+	{
+		*byte_stride = y210_byte_stride;
+	}
+
+	if (pixel_stride != NULL)
+	{
+		*pixel_stride = y210_pixel_stride;
+	}
+
+	return true;
+}
+
+/*
+ *  Calculate strides and strides for Y0L2 (YUYAAYVYAA, 4:2:0) format buffer.
+ *
+ * @param width         [in]    Buffer width.
+ * @param height        [in]    Buffer height.
+ * @param pixel_stride  [out]   Pixel stride; number of pixels between
+ *                              consecutive rows.
+ * @param byte_stride   [out]   Byte stride; number of bytes between
+ *                              consecutive rows.
+ * @param size          [out]   Size of the buffer in bytes. Cumulative sum of
+ *                              sizes of all planes.
+ *
+ * @return true if the calculation was successful; false otherwise (invalid
+ * parameter)
+ */
+static bool get_yuv_y0l2_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+{
+	int y0l2_byte_stride, y0l2_pixel_stride;
+
+	if (width & 3)
+	{
+		return false;
+	}
+
+	y0l2_pixel_stride = GRALLOC_ALIGN(width * 4, 16); /* 4 pixels packed per line */
+	y0l2_byte_stride  = GRALLOC_ALIGN(width * 4, 16); /* Packed in 64-bit chunks, 2 x downsampled horizontally */
+
+	if (size != NULL)
+	{
+		/* 2 x downsampled vertically */
+		*size = y0l2_byte_stride * (height/2);
+	}
+
+	if (byte_stride != NULL)
+	{
+		*byte_stride = y0l2_byte_stride;
+	}
+
+	if (pixel_stride != NULL)
+	{
+		*pixel_stride = y0l2_pixel_stride;
+	}
+	return true;
+}
+/*
+ *  Calculate strides and strides for Y410 (AVYU packed, 4:4:4) format buffer.
+ *
+ * @param width         [in]    Buffer width.
+ * @param height        [in]    Buffer height.
+ * @param pixel_stride  [out]   Pixel stride; number of pixels between
+ *                              consecutive rows.
+ * @param byte_stride   [out]   Byte stride; number of bytes between
+ *                              consecutive rows.
+ * @param size          [out]   Size of the buffer in bytes. Cumulative sum of
+ *                              sizes of all planes.
+ *
+ * @return true if the calculation was successful; false otherwise (invalid
+ * parameter)
+ */
+static bool get_yuv_y410_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+{
+	int y410_byte_stride, y410_pixel_stride;
+
+	y410_pixel_stride = GRALLOC_ALIGN(width, 16);
+	y410_byte_stride  = GRALLOC_ALIGN(width * 4, 16);
+
+	if (size != NULL)
+	{
+		/* 4x8bits per pixel */
+		*size = y410_byte_stride * height;
+	}
+
+	if (byte_stride != NULL)
+	{
+		*byte_stride = y410_byte_stride;
+	}
+
+	if (pixel_stride != NULL)
+	{
+		*pixel_stride = y410_pixel_stride;
+	}
+	return true;
+}
+
+/*
+ *  Calculate strides and strides for YUV420_AFBC (Compressed, 4:2:0) format buffer.
+ *
+ * @param width         [in]    Buffer width.
+ * @param height        [in]    Buffer height.
+ * @param pixel_stride  [out]   Pixel stride; number of pixels between
+ *                              consecutive rows.
+ * @param byte_stride   [out]   Byte stride; number of bytes between
+ *                              consecutive rows.
+ * @param size          [out]   Size of the buffer in bytes. Cumulative sum of
+ *                              sizes of all planes.
+ *
+ * @return true if the calculation was successful; false otherwise (invalid
+ * parameter)
+ */
+static bool get_yuv420_afbc_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+{
+	int yuv420_afbc_byte_stride, yuv420_afbc_pixel_stride;
+
+	if (width & 3)
+	{
+		return false;
+	}
+
+	width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+	height = GRALLOC_ALIGN(height/2, AFBC_PIXELS_PER_BLOCK); /* vertically downsampled */
+
+	yuv420_afbc_pixel_stride = GRALLOC_ALIGN(width, 16);
+	yuv420_afbc_byte_stride  = GRALLOC_ALIGN(width * 4, 16); /* 64-bit packed and horizontally downsampled */
+
+	if (size != NULL)
+	{
+		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
+		*size = yuv420_afbc_byte_stride * height
+			+ GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT);
+	}
+
+	if (byte_stride != NULL)
+	{
+		*byte_stride = yuv420_afbc_byte_stride;
+	}
+
+	if (pixel_stride != NULL)
+	{
+		*pixel_stride = yuv420_afbc_pixel_stride;
+	}
+
+	return true;
+}
+
 static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int usage, buffer_handle_t* pHandle, int* pStride)
 {
+
 	if (!pHandle || !pStride)
 	{
 		return -EINVAL;
@@ -251,7 +516,8 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	int byte_stride;   // Stride of the buffer in bytes
 	int pixel_stride;  // Stride of the buffer in pixels - as returned in pStride
 	uint64_t internal_format;
-	bool alloc_for_afbc=false;
+	AllocType type = UNCOMPRESSED;
+	bool alloc_for_extended_yuv;
 
 #if defined(GRALLOC_FB_SWAP_RED_BLUE)
 	/* match the framebuffer format */
@@ -267,45 +533,121 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 
 	internal_format = gralloc_select_format(format, usage);
 
-	alloc_for_afbc = (internal_format & GRALLOC_ARM_INTFMT_AFBC);
-
-	switch (internal_format & GRALLOC_ARM_INTFMT_FMT_MASK)
+	if (internal_format & (GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK))
 	{
-		case HAL_PIXEL_FORMAT_RGBA_8888:
-		case HAL_PIXEL_FORMAT_RGBX_8888:
-		case HAL_PIXEL_FORMAT_BGRA_8888:
+		if (usage & GRALLOC_USAGE_PRIVATE_2)
+		{
+			type = AFBC_PADDED;
+		}
+		else
+		{
+			type = AFBC;
+		}
+	}
+
+	alloc_for_extended_yuv = (internal_format & GRALLOC_ARM_INTFMT_EXTENDED_YUV) == GRALLOC_ARM_INTFMT_EXTENDED_YUV;
+
+	if (!alloc_for_extended_yuv)
+	{
+		switch (internal_format & GRALLOC_ARM_INTFMT_FMT_MASK)
+		{
+			case HAL_PIXEL_FORMAT_RGBA_8888:
+			case HAL_PIXEL_FORMAT_RGBX_8888:
+			case HAL_PIXEL_FORMAT_BGRA_8888:
 #if PLATFORM_SDK_VERSION >= 19
-		case HAL_PIXEL_FORMAT_sRGB_A_8888:
-		case HAL_PIXEL_FORMAT_sRGB_X_8888:
+			case HAL_PIXEL_FORMAT_sRGB_A_8888:
+			case HAL_PIXEL_FORMAT_sRGB_X_8888:
 #endif
-			get_rgb_stride_and_size(w, h, 4, &pixel_stride, &byte_stride, &size, alloc_for_afbc );
-			break;
-		case HAL_PIXEL_FORMAT_RGB_888:
-			get_rgb_stride_and_size(w, h, 3, &pixel_stride, &byte_stride, &size, alloc_for_afbc );
-			break;
-		case HAL_PIXEL_FORMAT_RGB_565:
+				get_rgb_stride_and_size(w, h, 4, &pixel_stride, &byte_stride, &size, type );
+				break;
+			case HAL_PIXEL_FORMAT_RGB_888:
+				get_rgb_stride_and_size(w, h, 3, &pixel_stride, &byte_stride, &size, type );
+				break;
+			case HAL_PIXEL_FORMAT_RGB_565:
 #if PLATFORM_SDK_VERSION < 19
-		case HAL_PIXEL_FORMAT_RGBA_5551:
-		case HAL_PIXEL_FORMAT_RGBA_4444:
+			case HAL_PIXEL_FORMAT_RGBA_5551:
+			case HAL_PIXEL_FORMAT_RGBA_4444:
 #endif
-			get_rgb_stride_and_size(w, h, 2, &pixel_stride, &byte_stride, &size, alloc_for_afbc );
-			break;
+				get_rgb_stride_and_size(w, h, 2, &pixel_stride, &byte_stride, &size, type );
+				break;
 
-		case HAL_PIXEL_FORMAT_YCrCb_420_SP:
-		case HAL_PIXEL_FORMAT_YV12:
-			if (!get_yv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, alloc_for_afbc))
-			{
+			case HAL_PIXEL_FORMAT_YCrCb_420_SP:
+			case HAL_PIXEL_FORMAT_YV12:
+				if (!get_yv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type))
+				{
+					return -EINVAL;
+				}
+				break;
+
+				/*
+				 * Additional custom formats can be added here
+				 * and must fill the variables pixel_stride, byte_stride and size.
+				 */
+
+			default:
 				return -EINVAL;
-			}
-			break;
+		}
+	}
+	else
+	{
+		switch (internal_format & GRALLOC_ARM_INTFMT_FMT_MASK)
+		{
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y0L2:
+				/* YUYAAYUVAA 4:2:0 */
+				if (false == get_yuv_y0l2_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
+				{
+					return -EINVAL;
+				}
+				break;
 
-			/*
-			 * Additional custom formats can be added here
-			 * and must fill the variables pixel_stride, byte_stride and size.
-			 */
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_P010:
+				/* Y-UV 4:2:0 */
+				if (false == get_yuv_pX10_stride_and_size(w, h, 2, &pixel_stride, &byte_stride, &size))
+				{
+					return -EINVAL;
+				}
+				break;
 
-		default:
-			return -EINVAL;
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_P210:
+				/* Y-UV 4:2:2 */
+				if (false == get_yuv_pX10_stride_and_size(w, h, 1, &pixel_stride, &byte_stride, &size))
+				{
+					return -EINVAL;
+				}
+				break;
+
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y210:
+				/* YUYV 4:2:0 */
+				if (false == get_yuv_y210_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
+				{
+					return -EINVAL;
+				}
+				break;
+
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y410:
+				/* AVYU 2-10-10-10 */
+				if (false == get_yuv_y410_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
+				{
+					return -EINVAL;
+				}
+				break;
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_AFBC:
+				if (type == AFBC_PADDED)
+				{
+					AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
+					return -EINVAL;
+				}
+
+				/* YUV 4:2:0 compressed */
+				if (false == get_yuv420_afbc_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
+				{
+					return -EINVAL;
+				}
+				break;
+			default:
+        		AERR("Invalid internal format %llx", internal_format & GRALLOC_ARM_INTFMT_FMT_MASK);
+				return -EINVAL;
+		}
 	}
 
 	int err;
@@ -356,18 +698,18 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	                             GRALLOC_USAGE_PRIVATE_1);
 	switch (private_usage)
 	{
-	case 0:
-		hnd->yuv_info = MALI_YUV_BT601_NARROW;
-		break;
-	case GRALLOC_USAGE_PRIVATE_1:
-		hnd->yuv_info = MALI_YUV_BT601_WIDE;
-		break;
-	case GRALLOC_USAGE_PRIVATE_0:
-		hnd->yuv_info = MALI_YUV_BT709_NARROW;
-		break;
-	case (GRALLOC_USAGE_PRIVATE_0 | GRALLOC_USAGE_PRIVATE_1):
-		hnd->yuv_info = MALI_YUV_BT709_WIDE;
-		break;
+		case 0:
+			hnd->yuv_info = MALI_YUV_BT601_NARROW;
+			break;
+		case GRALLOC_USAGE_PRIVATE_1:
+			hnd->yuv_info = MALI_YUV_BT601_WIDE;
+			break;
+		case GRALLOC_USAGE_PRIVATE_0:
+			hnd->yuv_info = MALI_YUV_BT709_NARROW;
+			break;
+		case (GRALLOC_USAGE_PRIVATE_0 | GRALLOC_USAGE_PRIVATE_1):
+			hnd->yuv_info = MALI_YUV_BT709_WIDE;
+			break;
 	}
 
 	hnd->width = w;

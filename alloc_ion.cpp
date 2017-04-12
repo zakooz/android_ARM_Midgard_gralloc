@@ -39,30 +39,28 @@ int alloc_backend_alloc(alloc_device_t* dev, size_t size, int usage, buffer_hand
 {
 	private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
 	ion_user_handle_t ion_hnd;
-	unsigned char *cpu_ptr;
+	unsigned char *cpu_ptr = NULL;
 	int shared_fd;
 	int ret;
 	unsigned int heap_mask;
-
-	/*
-	 * The following switch statement is intended to support the use of
-	 * platform specific ION heaps using the gralloc private usage
-	 * flags.
-	 */
-	switch((GRALLOC_USAGE_PRIVATE_2 | GRALLOC_USAGE_PRIVATE_3) & usage)
-	{
-	/* Example ion heap choice customization. */
-	/*
-	 *case GRALLOC_USAGE_PRIVATE_3:
-	 *	heap_mask = ION_HEAP_TYPE_CARVEOUT;
-	 *	break;
-	 */
-	default:
-		heap_mask = ION_HEAP_SYSTEM_MASK;
-		break;
-	}
-
 	int ion_flags = 0;
+	static int support_protected = 1; /* initially, assume we support protected memory */
+	int lock_state = 0;
+
+	/* Select heap type based on usage hints */
+	if(usage & GRALLOC_USAGE_PROTECTED)
+	{
+#if defined(ION_HEAP_SECURE_MASK)
+		heap_mask = ION_HEAP_SECURE_MASK;
+#else
+		AERR("Protected ION memory is not supported on this platform.");
+		return -1;
+#endif
+	}
+	else
+	{
+		heap_mask = ION_HEAP_SYSTEM_MASK;
+	}
 
 	if ( (usage & GRALLOC_USAGE_SW_READ_MASK) == GRALLOC_USAGE_SW_READ_OFTEN )
 	{
@@ -85,17 +83,23 @@ int alloc_backend_alloc(alloc_device_t* dev, size_t size, int usage, buffer_hand
 		if ( 0 != ion_free( m->ion_client, ion_hnd ) ) AERR( "ion_free( %d ) failed", m->ion_client );		
 		return -1;
 	}
-	cpu_ptr = (unsigned char*)mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shared_fd, 0 );
 
-	if ( MAP_FAILED == cpu_ptr )
+	if (!(usage & GRALLOC_USAGE_PROTECTED))
 	{
-		AERR( "ion_map( %d ) failed", m->ion_client );
-		if ( 0 != ion_free( m->ion_client, ion_hnd ) ) AERR( "ion_free( %d ) failed", m->ion_client );		
-		close( shared_fd );
-		return -1;
+		cpu_ptr = (unsigned char*)mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shared_fd, 0 );
+
+		if ( MAP_FAILED == cpu_ptr )
+		{
+			AERR( "ion_map( %d ) failed", m->ion_client );
+			if ( 0 != ion_free( m->ion_client, ion_hnd ) ) AERR( "ion_free( %d ) failed", m->ion_client );
+			close( shared_fd );
+			return -1;
+		}
+		lock_state = private_handle_t::LOCK_STATE_MAPPED;
 	}
 
-	private_handle_t *hnd = new private_handle_t( private_handle_t::PRIV_FLAGS_USES_ION, usage, size, cpu_ptr, private_handle_t::LOCK_STATE_MAPPED );
+	private_handle_t *hnd = new private_handle_t( private_handle_t::PRIV_FLAGS_USES_ION, usage, size, cpu_ptr,
+	                                              lock_state );
 
 	if ( NULL != hnd )
 	{
@@ -110,8 +114,13 @@ int alloc_backend_alloc(alloc_device_t* dev, size_t size, int usage, buffer_hand
 	}
 
 	close( shared_fd );
-	ret = munmap( cpu_ptr, size );
-	if ( 0 != ret ) AERR( "munmap failed for base:%p size: %zd", cpu_ptr, size );
+
+	if(!(usage & GRALLOC_USAGE_PROTECTED))
+	{
+		ret = munmap( cpu_ptr, size );
+		if ( 0 != ret ) AERR( "munmap failed for base:%p size: %zd", cpu_ptr, size );
+	}
+
 	ret = ion_free( m->ion_client, ion_hnd );
 	if ( 0 != ret ) AERR( "ion_free( %d ) failed", m->ion_client );
 	return -1;

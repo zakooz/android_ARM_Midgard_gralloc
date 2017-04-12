@@ -20,6 +20,21 @@
 #include <hardware/gralloc.h>
 #include "format_chooser.h"
 
+#define GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_AFBC(x) \
+			(((x) > GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC && \
+			(x) <= (GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC + 0xff)) || \
+			((x) == (GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC + HAL_PIXEL_FORMAT_YV12)))
+#define GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_AFBC_SPLITBLK(x) \
+			(((x) > GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_SPLITBLK && \
+			(x) <= (GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_SPLITBLK + 0xff)) || \
+			((x) == ( GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_SPLITBLK + HAL_PIXEL_FORMAT_YV12)))
+
+#define GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_BASE_YUVEXT(x) \
+			(((x & GRALLOC_ARM_INTFMT_FMT_MASK) >= \
+				(GRALLOC_ARM_HAL_FORMAT_INDEXED_Y0L2 + GRALLOC_ANDROID_PRIVATE_RANGE_BASE_YUVEXT)) && \
+			((x & GRALLOC_ARM_INTFMT_FMT_MASK) <= \
+				(GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_AFBC + GRALLOC_ANDROID_PRIVATE_RANGE_BASE_YUVEXT)))
+
 static inline int find_format_index(int format)
 {
 	int index=-1;
@@ -81,8 +96,57 @@ uint64_t gralloc_select_format(int req_format, int usage)
 	int n=0;
 	int largest_weight_ind=-1;
 	int16_t accum_weights[GRALLOC_ARM_FORMAT_INTERNAL_INDEXED_LAST] = {0};
+	int afbc_split_mode = 0;
 
 	ALOGV("gralloc_select_format: req_format=0x%x usage=0x%x\n",req_format,usage);
+
+	/* The GRALLOC_USAGE_PRIVATE_3 set in the usage field indicates the req_format is
+	 * to be treated as encoded private format instead of trying to find closest match.
+	 * At the time being, the flag is used for testing AFBC and 10bit YUV that are not
+	 * yet supported by Android HAL */
+	/* Decode the passed in private format and get the gralloc indexed formats */
+	if (usage & GRALLOC_USAGE_PRIVATE_3)
+	{
+		uint64_t result = 0;
+	   	/* req_format is within the range for normal AFBC formats */
+		if (GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_AFBC(req_format))
+		{
+			req_format = req_format - GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC;
+			result = req_format | GRALLOC_ARM_INTFMT_AFBC;
+			return result;
+		}
+		else if (GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_AFBC_SPLITBLK(req_format))
+		{
+			req_format = req_format - GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_SPLITBLK;
+			result = req_format | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK;
+			return result;
+		}
+		else if (GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_BASE_YUVEXT(req_format))
+		{
+			req_format = req_format - GRALLOC_ANDROID_PRIVATE_RANGE_BASE_YUVEXT;
+			switch (req_format & GRALLOC_ARM_INTFMT_FMT_MASK)
+			{
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_AFBC:
+					result = (GRALLOC_ARM_INTFMT_AFBC);
+					/* pass through */
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y0L2:
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_P010:
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_P210:
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y210:
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y410:
+					/* preserve the format + possible AFBC flag, and add extended-yuv flag */
+					result |= GRALLOC_ARM_INTFMT_EXTENDED_YUV;
+					result |= (req_format & (GRALLOC_ARM_INTFMT_FMT_MASK | GRALLOC_ARM_INTFMT_AFBC));
+					break;
+			}
+			return result;
+		}
+		else
+		{
+			/* invalid format value */
+			return -EINVAL;
+		}
+	}
 
 	if( req_format == 0 )
 	{
@@ -124,7 +188,6 @@ uint64_t gralloc_select_format(int req_format, int usage)
 				if( blklist[n].hwblkconf.weights[intformat_ind][m] != DEFAULT_WEIGHT_UNSUPPORTED )
 				{
 					accum_weights[m] += blklist[n].hwblkconf.weights[intformat_ind][m];
-
 
 					if( largest_weight_ind < 0 ||
 						accum_weights[m] > accum_weights[largest_weight_ind])

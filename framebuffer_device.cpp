@@ -425,8 +425,8 @@ int framebuffer_device_open(hw_module_t const* module, const char* name, hw_devi
 	alloc_device_t* gralloc_device;
 #if DISABLE_FRAMEBUFFER_HAL == 1
 	AERR("Framebuffer HAL not support/disabled %s",
-#if MALI_DISPALY_DP500 == 1
-	"with MALI DP500");
+#ifdef MALI_DISPLAY_VERSION
+	"with MALI display enable");
 #else
 	"");
 #endif

@@ -28,8 +28,8 @@
 
 #if MALI_AFBC_GRALLOC == 1
 #include 	"formatdef_files/gpu_afbc.defs"
-#if MALI_DISPLAY_DP500 == 1
-#include 	"formatdef_files/dp500_afbc.defs"
+#ifdef MALI_DISPLAY_VERSION
+#include 	"formatdef_files/display_afbc.defs"
 #endif
 #endif
 
@@ -142,13 +142,21 @@ const internal_fmt_info translate_internal_indexed[GRALLOC_ARM_FORMAT_INTERNAL_I
 	{
 		HAL_PIXEL_FORMAT_YV12 | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK,
 		{GRALLOC_ARM_HAL_FORMAT_INDEXED_YV12}
-	}
+	},
+
+	/* No mapping as there is no corresponding HAL formats */
+	{0, {GRALLOC_ARM_HAL_FORMAT_INDEXED_Y0L2}},
+	{0, {GRALLOC_ARM_HAL_FORMAT_INDEXED_P010}},
+	{0, {GRALLOC_ARM_HAL_FORMAT_INDEXED_P210}},
+	{0, {GRALLOC_ARM_HAL_FORMAT_INDEXED_Y210}},
+	{0, {GRALLOC_ARM_HAL_FORMAT_INDEXED_Y410}},
+	{0, {GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_AFBC}},
 };
 
 blkinit blklist[] =
 {
 #if MALI_AFBC_GRALLOC == 1
-#if MALI_DISPLAY_DP500 == 1
+#ifdef MALI_DISPLAY_VERSION
 	{
 		display_afbc_hwc_blkinit,{0,{}}
 	},

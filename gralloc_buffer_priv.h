@@ -33,7 +33,6 @@ struct attr_region
 	int crop_right;
 	int use_yuv_transform;
 	int use_sparse_alloc;
-
 } __attribute__ ((packed));
 
 typedef struct attr_region attr_region;
@@ -54,7 +53,6 @@ enum
 
 	/* Set if the AFBC format uses sparse allocation */
 	GRALLOC_ARM_BUFFER_ATTR_AFBC_SPARSE_ALLOC          = 3,
-
 	GRALLOC_ARM_BUFFER_ATTR_LAST
 };
 
@@ -66,7 +64,7 @@ typedef uint32_t buf_attr;
  *
  * Return 0 on success.
  */
-int gralloc_buffer_attr_allocate( private_handle_t *hnd );
+int gralloc_buffer_attr_allocate( struct private_handle_t *hnd );
 
 /*
  * Frees the shared memory allocated for attribute storage.
@@ -74,7 +72,7 @@ int gralloc_buffer_attr_allocate( private_handle_t *hnd );
 
  * Return 0 on success.
  */
-int gralloc_buffer_attr_free( private_handle_t *hnd );
+int gralloc_buffer_attr_free( struct private_handle_t *hnd );
 
 /*
  * Map the attribute storage area before attempting to
@@ -82,7 +80,7 @@ int gralloc_buffer_attr_free( private_handle_t *hnd );
  *
  * Return 0 on success.
  */
-static inline int gralloc_buffer_attr_map( private_handle_t *hnd, bool readwrite)
+static inline int gralloc_buffer_attr_map( struct private_handle_t *hnd, int readwrite)
 {
 	int rval = -1;
 	int prot_flags = PROT_READ;
@@ -119,7 +117,7 @@ out:
  *
  * Return 0 on success.
  */
-static inline int gralloc_buffer_attr_unmap( private_handle_t *hnd )
+static inline int gralloc_buffer_attr_unmap( struct private_handle_t *hnd )
 {
 	int rval = -1;
 
@@ -144,7 +142,7 @@ out:
  *
  * Return 0 on success.
  */
-static inline int gralloc_buffer_attr_write( private_handle_t *hnd, buf_attr attr, int *val )
+static inline int gralloc_buffer_attr_write( struct private_handle_t *hnd, buf_attr attr, int *val )
 {
 	int rval = -1;
 
@@ -178,7 +176,7 @@ out:
 	return rval;
 }
 
-static inline int gralloc_buffer_attr_read( private_handle_t *hnd, buf_attr attr, int *val )
+static inline int gralloc_buffer_attr_read( struct private_handle_t *hnd, buf_attr attr, int *val )
 {
 	int rval = -1;
 
