@@ -48,6 +48,7 @@ LOCAL_SRC_FILES := \
 	gralloc_module.cpp \
 	alloc_device.cpp \
 	$(ALLOCATOR_SPECIFIC_FILES) \
-	framebuffer_device.cpp
+	framebuffer_device.cpp \
+	gralloc_vsync_default.cpp
 
 include $(BUILD_SHARED_LIBRARY)

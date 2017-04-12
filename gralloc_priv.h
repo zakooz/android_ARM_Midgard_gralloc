@@ -80,6 +80,13 @@ typedef enum
 	MALI_YUV_BT709_WIDE,
 } mali_gralloc_yuv_info;
 
+typedef enum
+{
+	MALI_DPY_TYPE_UNKNOWN = 0,
+	MALI_DPY_TYPE_CLCD,
+	MALI_DPY_TYPE_HDLCD,
+} mali_dpy_type;
+
 struct private_handle_t;
 
 struct private_module_t
@@ -93,12 +100,14 @@ struct private_module_t
 	pthread_mutex_t lock;
 	buffer_handle_t currentBuffer;
 	int ion_client;
+	mali_dpy_type dpy_type;
 
 	struct fb_var_screeninfo info;
 	struct fb_fix_screeninfo finfo;
 	float xdpi;
 	float ydpi;
 	float fps;
+	int swapInterval;
 
 	enum
 	{

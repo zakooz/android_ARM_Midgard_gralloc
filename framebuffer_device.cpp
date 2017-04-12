@@ -29,11 +29,10 @@
 
 #include <GLES/gl.h>
 
-#include "gralloc_vsync_report.h"
-
 #include "alloc_device.h"
 #include "gralloc_priv.h"
 #include "gralloc_helper.h"
+#include "gralloc_vsync.h"
 
 // numbers of buffers for page flipping
 #define NUM_BUFFERS NUM_FB_BUFFERS 
@@ -51,7 +50,12 @@ static int fb_set_swap_interval(struct framebuffer_device_t* dev, int interval)
 		return -EINVAL;
 	}
 
-	// Currently not implemented
+	private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
+	m->swapInterval = interval;
+
+	if (0 == interval) gralloc_vsync_disable(dev);
+	else gralloc_vsync_enable(dev);
+
 	return 0;
 }
 
@@ -82,56 +86,26 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
 		m->info.yoffset = offset / m->finfo.line_length;
 
 #ifdef STANDARD_LINUX_SCREEN
-#define FBIO_WAITFORVSYNC       _IOW('F', 0x20, __u32)
-#define S3CFB_SET_VSYNC_INT	_IOW('F', 206, unsigned int)
 		if (ioctl(m->framebuffer->fd, FBIOPAN_DISPLAY, &m->info) == -1) 
 		{
 			AERR( "FBIOPAN_DISPLAY failed for fd: %d", m->framebuffer->fd );
 			m->base.unlock(&m->base, buffer); 
-			return 0;
+			return -errno;
 		}
-
-		{
-			// enable VSYNC
-			interrupt = 1;
-			if(ioctl(m->framebuffer->fd, S3CFB_SET_VSYNC_INT, &interrupt) < 0) 
-			{
-				AERR( "S3CFB_SET_VSYNC_INT enable failed for fd: %d", m->framebuffer->fd );
-				m->base.unlock(&m->base, buffer); 
-				return 0;
-			}
-			// wait for VSYNC
-			gralloc_mali_vsync_report(MALI_VSYNC_EVENT_BEGIN_WAIT);
-			int crtc = 0;
-			if(ioctl(m->framebuffer->fd, FBIO_WAITFORVSYNC, &crtc) < 0)
-			{
-				AERR( "FBIO_WAITFORVSYNC failed for fd: %d", m->framebuffer->fd );
-				gralloc_mali_vsync_report(MALI_VSYNC_EVENT_END_WAIT);
-				m->base.unlock(&m->base, buffer); 
-				return 0;
-			}
-			gralloc_mali_vsync_report(MALI_VSYNC_EVENT_END_WAIT);
-			// disable VSYNC
-			interrupt = 0;
-			if(ioctl(m->framebuffer->fd, S3CFB_SET_VSYNC_INT, &interrupt) < 0) 
-			{
-				AERR( "S3CFB_SET_VSYNC_INT disable failed for fd: %d", m->framebuffer->fd );
-				m->base.unlock(&m->base, buffer); 
-				return 0;
-			}
-		}
-#else 
-		/*Standard Android way*/
-		gralloc_mali_vsync_report(MALI_VSYNC_EVENT_BEGIN_WAIT);
+#else /*Standard Android way*/
 		if (ioctl(m->framebuffer->fd, FBIOPUT_VSCREENINFO, &m->info) == -1) 
 		{
 			AERR( "FBIOPUT_VSCREENINFO failed for fd: %d", m->framebuffer->fd );
-			gralloc_mali_vsync_report(MALI_VSYNC_EVENT_END_WAIT);
 			m->base.unlock(&m->base, buffer); 
 			return -errno;
 		}
-		gralloc_mali_vsync_report(MALI_VSYNC_EVENT_END_WAIT);
 #endif
+		if ( 0 != gralloc_wait_for_vsync(dev) )
+		{
+			AERR( "Gralloc wait for vsync failed for fd: %d", m->framebuffer->fd );
+			m->base.unlock(&m->base, buffer); 
+			return -errno;
+		}
 		m->currentBuffer = buffer;
 	} 
 	else
@@ -337,12 +311,25 @@ int init_frame_buffer_locked(struct private_module_t* module)
 	     info.height, ydpi,
 	     fps);
 
+	if (0 == strncmp(finfo.id, "CLCD FB", 7))
+	{
+		module->dpy_type = MALI_DPY_TYPE_CLCD;
+	}
+	else if (0 == strncmp(finfo.id, "ARM Mali HDLCD", 14))
+	{
+		module->dpy_type = MALI_DPY_TYPE_HDLCD;
+	}
+	else
+	{
+		module->dpy_type = MALI_DPY_TYPE_UNKNOWN;
+	}
+
 	if (ioctl(fd, FBIOGET_FSCREENINFO, &finfo) == -1)
 	{
 		return -errno;
 	}
 
-    if (finfo.smem_len <= 0)
+	if (finfo.smem_len <= 0)
 	{
 		return -errno;
 	}
@@ -353,6 +340,7 @@ int init_frame_buffer_locked(struct private_module_t* module)
 	module->xdpi = xdpi;
 	module->ydpi = ydpi;
 	module->fps = fps;
+	module->swapInterval = 1;
 
 	/*
 	 * map the framebuffer
@@ -477,7 +465,8 @@ int framebuffer_device_open(hw_module_t const* module, const char* name, hw_devi
 	const_cast<int&>(dev->minSwapInterval) = 1;
 	const_cast<int&>(dev->maxSwapInterval) = 1;
 	*device = &dev->common;
-	status = 0;
+
+	gralloc_vsync_enable(dev);
 
 	return status;
 }
