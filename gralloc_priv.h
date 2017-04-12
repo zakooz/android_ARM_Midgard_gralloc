@@ -200,6 +200,8 @@ struct private_handle_t
 	int        size;
 	int        width;
 	int        height;
+	int        internalWidth;
+	int        internalHeight;
 	int        stride;
 	union {
 		void*    base;

@@ -28,12 +28,15 @@
 			(((x) > GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_SPLITBLK && \
 			(x) <= (GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_SPLITBLK + 0xff)) || \
 			((x) == ( GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_SPLITBLK + HAL_PIXEL_FORMAT_YV12)))
-
+#define GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_AFBC_WIDEBLK(x) \
+            (((x) > GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_WIDEBLK && \
+            (x) <= (GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_WIDEBLK + 0xff)) || \
+            ((x) == ( GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_WIDEBLK + HAL_PIXEL_FORMAT_YV12)))
 #define GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_BASE_YUVEXT(x) \
 			(((x & GRALLOC_ARM_INTFMT_FMT_MASK) >= \
 				(GRALLOC_ARM_HAL_FORMAT_INDEXED_Y0L2 + GRALLOC_ANDROID_PRIVATE_RANGE_BASE_YUVEXT)) && \
 			((x & GRALLOC_ARM_INTFMT_FMT_MASK) <= \
-				(GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_AFBC + GRALLOC_ANDROID_PRIVATE_RANGE_BASE_YUVEXT)))
+				(GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_10BIT_AFBC + GRALLOC_ANDROID_PRIVATE_RANGE_BASE_YUVEXT)))
 
 static inline int find_format_index(int format)
 {
@@ -113,12 +116,24 @@ uint64_t gralloc_select_format(int req_format, int usage)
 		{
 			req_format = req_format - GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC;
 			result = req_format | GRALLOC_ARM_INTFMT_AFBC;
+			switch (req_format & GRALLOC_ARM_INTFMT_FMT_MASK)
+			{
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_8BIT_AFBC:
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_8BIT_AFBC:
+					result |= GRALLOC_ARM_INTFMT_ARM_AFBC_YUV;
+					break;
+			}
 			return result;
 		}
 		else if (GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_AFBC_SPLITBLK(req_format))
 		{
 			req_format = req_format - GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_SPLITBLK;
 			result = req_format | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK;
+			/* We don't support yuv 4:2:2 afbc split mode */
+			if (req_format == GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_8BIT_AFBC)
+			{
+				result |= GRALLOC_ARM_INTFMT_ARM_AFBC_YUV;
+			}
 			return result;
 		}
 		else if (GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_BASE_YUVEXT(req_format))
@@ -126,8 +141,9 @@ uint64_t gralloc_select_format(int req_format, int usage)
 			req_format = req_format - GRALLOC_ANDROID_PRIVATE_RANGE_BASE_YUVEXT;
 			switch (req_format & GRALLOC_ARM_INTFMT_FMT_MASK)
 			{
-				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_AFBC:
-					result = (GRALLOC_ARM_INTFMT_AFBC);
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_10BIT_AFBC:
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_10BIT_AFBC:
+					result = (GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_INTFMT_ARM_AFBC_YUV);
 					/* pass through */
 				case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y0L2:
 				case GRALLOC_ARM_HAL_FORMAT_INDEXED_P010:
@@ -136,7 +152,38 @@ uint64_t gralloc_select_format(int req_format, int usage)
 				case GRALLOC_ARM_HAL_FORMAT_INDEXED_Y410:
 					/* preserve the format + possible AFBC flag, and add extended-yuv flag */
 					result |= GRALLOC_ARM_INTFMT_EXTENDED_YUV;
-					result |= (req_format & (GRALLOC_ARM_INTFMT_FMT_MASK | GRALLOC_ARM_INTFMT_AFBC));
+					result |= (req_format & (GRALLOC_ARM_INTFMT_FMT_MASK | GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_INTFMT_ARM_AFBC_YUV));
+					break;
+			}
+			return result;
+		}
+		else if (GRALLOC_ANDROID_PRIVATE_IN_RANGE_OF_AFBC_WIDEBLK(req_format))
+		{
+			req_format = req_format - GRALLOC_ANDROID_PRIVATE_RANGE_BASE_AFBC_WIDEBLK;
+			switch (req_format & GRALLOC_ARM_INTFMT_FMT_MASK)
+			{
+				case HAL_PIXEL_FORMAT_RGBA_8888:
+				case HAL_PIXEL_FORMAT_RGBX_8888:
+				case HAL_PIXEL_FORMAT_BGRA_8888:
+				case HAL_PIXEL_FORMAT_RGB_888:
+					result = req_format | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK | GRALLOC_ARM_INTFMT_AFBC_WIDEBLK;
+					break;
+				case HAL_PIXEL_FORMAT_RGB_565:
+				case HAL_PIXEL_FORMAT_YV12:
+					result = req_format | GRALLOC_ARM_INTFMT_AFBC_WIDEBLK;
+					break;
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_8BIT_AFBC:
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_8BIT_AFBC:
+					result = req_format | GRALLOC_ARM_INTFMT_AFBC_WIDEBLK | GRALLOC_ARM_INTFMT_ARM_AFBC_YUV;
+					break;
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_10BIT_AFBC:
+				case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_10BIT_AFBC:
+					result = GRALLOC_ARM_INTFMT_EXTENDED_YUV | GRALLOC_ARM_INTFMT_ARM_AFBC_YUV;
+					result |= (req_format & ( GRALLOC_ARM_INTFMT_FMT_MASK | GRALLOC_ARM_INTFMT_AFBC_WIDEBLK ));
+					break;
+				default:
+					ALOGV("Gralloc gets internal HAL pixel format: 0x%llX", (req_format & GRALLOC_ARM_INTFMT_FMT_MASK));
+					result = req_format | GRALLOC_ARM_INTFMT_AFBC_WIDEBLK;
 					break;
 			}
 			return result;

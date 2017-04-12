@@ -40,6 +40,7 @@
 #define AFBC_PIXELS_PER_BLOCK                    16
 #define AFBC_BODY_BUFFER_BYTE_ALIGNMENT          1024
 #define AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY  16
+#define AFBC_WIDEBLK_WIDTH_ALIGN                 32
 
 static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev, size_t size, int usage, buffer_handle_t* pHandle, int* stride, int* byte_stride)
 {
@@ -136,7 +137,8 @@ enum AllocType
 {
 	UNCOMPRESSED = 0,
 	AFBC,
-
+	/* AFBC_WIDEBLK mode requires buffer to have 32 * 16 pixels alignment */
+	AFBC_WIDEBLK,
 	/* AN AFBC buffer with additional padding to ensure a 64-bte alignment
 	 * for each row of blocks in the header */
 	AFBC_PADDED
@@ -184,17 +186,22 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
 	{
 		int w_aligned;
 		int h_aligned = GRALLOC_ALIGN( height, AFBC_PIXELS_PER_BLOCK );
-
+		int nblocks;
+		
 		if (type == AFBC_PADDED)
 		{
 			w_aligned = GRALLOC_ALIGN( width, 64 );
+		}
+		else if (type == AFBC_WIDEBLK)
+		{
+			w_aligned = GRALLOC_ALIGN( width, AFBC_WIDEBLK_WIDTH_ALIGN );
 		}
 		else
 		{
 			w_aligned = GRALLOC_ALIGN( width, AFBC_PIXELS_PER_BLOCK );
 		}
 
-		int nblocks = w_aligned / AFBC_PIXELS_PER_BLOCK * h_aligned / AFBC_PIXELS_PER_BLOCK;
+		nblocks = w_aligned / AFBC_PIXELS_PER_BLOCK * h_aligned / AFBC_PIXELS_PER_BLOCK;
 
 		if ( size != NULL )
 		{
@@ -205,18 +212,89 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
 }
 
 /*
+ * Computes the strides and size for an AFBC 8BIT YUV 4:2:0 buffer
+ *
+ * width                Public known width of the buffer in pixels
+ * height               Public known height of the buffer in pixels
+ *
+ * pixel_stride   (out) stride of the buffer in pixels
+ * byte_stride    (out) stride of the buffer in bytes
+ * size           (out) size of the buffer in bytes
+ * type                 if buffer should be allocated for a certain afbc type
+ * internalHeight (out) Will store internal height if it is required to have a greater height than
+ *                      known to public. If not it will be left untouched.
+ */
+static bool get_afbc_yuv420_8bit_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size, AllocType type, int *internalHeight)
+{
+	int yuv420_afbc_luma_stride, yuv420_afbc_chroma_stride;
+	
+	if (type == UNCOMPRESSED)
+	{
+		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV420_10BIT_AFBC!");
+		return false;
+	}
+	
+	if (type == AFBC_PADDED)
+	{
+		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
+		return false;
+	}
+	
+	if (type == AFBC_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+	}
+	else
+	{
+		width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+	}
+	height = GRALLOC_ALIGN(height, AFBC_PIXELS_PER_BLOCK);
+
+#if AFBC_YUV420_EXTRA_MB_ROW_NEEDED
+	/* If we have a greater internal height than public we set the internalHeight. This
+	 * implies that cropping will be applied of internal dimensions to fit the public one. */
+	*internalHeight += AFBC_PIXELS_PER_BLOCK;
+#endif
+
+	yuv420_afbc_luma_stride = width;
+	yuv420_afbc_chroma_stride = GRALLOC_ALIGN(yuv420_afbc_luma_stride / 2, 16); /* Horizontal downsampling*/
+
+	if (size != NULL)
+	{
+		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
+		/* Simplification of (height * luma-stride + 2 * (height /2 * chroma_stride) */
+		*size = (yuv420_afbc_luma_stride + yuv420_afbc_chroma_stride) * height
+			+ GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT);
+	}
+
+	if (byte_stride != NULL)
+	{
+		*byte_stride = yuv420_afbc_luma_stride;
+	}
+
+	if (pixel_stride != NULL)
+	{
+		*pixel_stride = yuv420_afbc_luma_stride;
+	}
+
+	return true;
+}
+
+/*
  * Computes the strides and size for an YV12 buffer
  *
- * width               width of the buffer in pixels
- * height              height of the buffer in pixels
+ * width                Public known width of the buffer in pixels
+ * height               Public known height of the buffer in pixels
  *
- * pixel_stride (out)  stride of the buffer in pixels
- * byte_stride  (out)  stride of the buffer in bytes
- * size         (out)  size of the buffer in bytes
- * type         (in)   if buffer should be allocated for afbc
+ * pixel_stride   (out) stride of the buffer in pixels
+ * byte_stride    (out) stride of the buffer in bytes
+ * size           (out) size of the buffer in bytes
+ * type           (in)  if buffer should be allocated for a certain afbc type
+ * internalHeight (out) Will store internal height if it is required to have a greater height than
+ *                      known to public. If not it will be left untouched.
  */
 static bool get_yv12_stride_and_size(int width, int height,
-                                     int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
+                                     int* pixel_stride, int* byte_stride, size_t* size, AllocType type, int* internalHeight)
 {
 	int luma_stride;
 
@@ -225,19 +303,12 @@ static bool get_yv12_stride_and_size(int width, int height,
 	{
 		return false;
 	}
-
-	if (type != UNCOMPRESSED && size != NULL)
+	
+	if (type != UNCOMPRESSED)
 	{
-		if (type == AFBC_PADDED)
-		{
-			AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
-			return false;
-		}
-
-		width = GRALLOC_ALIGN( width, AFBC_PIXELS_PER_BLOCK );
-		height = GRALLOC_ALIGN( height, AFBC_PIXELS_PER_BLOCK );
+		return get_afbc_yuv420_8bit_stride_and_size(width, height, pixel_stride, byte_stride, size, type, internalHeight);
 	}
-
+	
 	/* Android assumes the buffer should be aligned to 16. */
 	luma_stride = GRALLOC_ALIGN(width, 16);
 
@@ -258,12 +329,64 @@ static bool get_yv12_stride_and_size(int width, int height,
 		*pixel_stride = luma_stride;
 	}
 
-	if ( type != UNCOMPRESSED && size != NULL )
+	return true;
+}
+
+/*
+ * Computes the strides and size for an AFBC 8BIT YUV 4:2:2 buffer
+ *
+ * width               width of the buffer in pixels
+ * height              height of the buffer in pixels
+ *
+ * pixel_stride (out)  stride of the buffer in pixels
+ * byte_stride  (out)  stride of the buffer in bytes
+ * size         (out)  size of the buffer in bytes
+ * type                if buffer should be allocated for a certain afbc type
+ */
+static bool get_afbc_yuv422_8bit_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
+{
+	int yuv422_afbc_luma_stride;
+
+	if (type == UNCOMPRESSED)
+	{
+		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV420_10BIT_AFBC!");
+		return false;
+	}
+	
+	if (type == AFBC_PADDED)
+	{
+		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
+		return false;
+	}
+	
+	if (type == AFBC_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+	}
+	else
+	{
+		width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+	}
+	height = GRALLOC_ALIGN(height, AFBC_PIXELS_PER_BLOCK);
+	
+	yuv422_afbc_luma_stride = width;
+
+	if (size != NULL)
 	{
 		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
+		/* YUV 4:2:2 luma size equals chroma size */
+		*size = yuv422_afbc_luma_stride * height * 2
+			+ GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT);
+	}
 
-		/* Just append header block size, width/height alignment done above */
-		*size += GRALLOC_ALIGN( nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT );
+	if (byte_stride != NULL)
+	{
+		*byte_stride = yuv422_afbc_luma_stride;
+	}
+
+	if (pixel_stride != NULL)
+	{
+		*pixel_stride = yuv422_afbc_luma_stride;
 	}
 
 	return true;
@@ -455,7 +578,7 @@ static bool get_yuv_y410_stride_and_size(int width, int height, int* pixel_strid
 }
 
 /*
- *  Calculate strides and strides for YUV420_AFBC (Compressed, 4:2:0) format buffer.
+ *  Calculate strides and strides for YUV420_10BIT_AFBC (Compressed, 4:2:0) format buffer.
  *
  * @param width         [in]    Buffer width.
  * @param height        [in]    Buffer height.
@@ -465,11 +588,12 @@ static bool get_yuv_y410_stride_and_size(int width, int height, int* pixel_strid
  *                              consecutive rows.
  * @param size          [out]   Size of the buffer in bytes. Cumulative sum of
  *                              sizes of all planes.
+ * @param type          [in]    afbc mode that buffer should be allocated with.
  *
  * @return true if the calculation was successful; false otherwise (invalid
  * parameter)
  */
-static bool get_yuv420_afbc_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size)
+static bool get_yuv420_10bit_afbc_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
 {
 	int yuv420_afbc_byte_stride, yuv420_afbc_pixel_stride;
 
@@ -477,8 +601,27 @@ static bool get_yuv420_afbc_stride_and_size(int width, int height, int* pixel_st
 	{
 		return false;
 	}
-
-	width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+	
+	if (type == UNCOMPRESSED)
+	{
+		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV420_10BIT_AFBC!");
+		return false;
+	}
+	
+	if (type == AFBC_PADDED)
+	{
+		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
+		return false;
+	}
+	
+	if (type == AFBC_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+	}
+	else
+	{
+		width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+	}
 	height = GRALLOC_ALIGN(height/2, AFBC_PIXELS_PER_BLOCK); /* vertically downsampled */
 
 	yuv420_afbc_pixel_stride = GRALLOC_ALIGN(width, 16);
@@ -504,6 +647,77 @@ static bool get_yuv420_afbc_stride_and_size(int width, int height, int* pixel_st
 	return true;
 }
 
+/*
+ *  Calculate strides and strides for YUV422_10BIT_AFBC (Compressed, 4:2:2) format buffer.
+ *
+ * @param width         [in]    Buffer width.
+ * @param height        [in]    Buffer height.
+ * @param pixel_stride  [out]   Pixel stride; number of pixels between
+ *                              consecutive rows.
+ * @param byte_stride   [out]   Byte stride; number of bytes between
+ *                              consecutive rows.
+ * @param size          [out]   Size of the buffer in bytes. Cumulative sum of
+ *                              sizes of all planes.
+ * @param type          [in]    afbc mode that buffer should be allocated with.
+ *
+ * @return true if the calculation was successful; false otherwise (invalid
+ * parameter)
+ */
+static bool get_yuv422_10bit_afbc_stride_and_size(int width, int height, int* pixel_stride, int* byte_stride, size_t* size, AllocType type)
+{
+	int yuv422_afbc_byte_stride, yuv422_afbc_pixel_stride;
+
+	if (width & 3)
+	{
+		return false;
+	}
+	
+	if (type == UNCOMPRESSED)
+	{
+		AERR(" Buffer must be allocated with AFBC mode for internal pixel format YUV420_10BIT_AFBC!");
+		return false;
+	}
+
+	if (type == AFBC_PADDED)
+	{
+		AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
+		return false;
+	}
+
+	if (type == AFBC_WIDEBLK)
+	{
+		width = GRALLOC_ALIGN(width, AFBC_WIDEBLK_WIDTH_ALIGN);
+	}
+	else
+	{
+		width = GRALLOC_ALIGN(width, AFBC_PIXELS_PER_BLOCK);
+	}
+	height = GRALLOC_ALIGN(height, AFBC_PIXELS_PER_BLOCK); /* total number of rows must be even number */
+
+	yuv422_afbc_pixel_stride = GRALLOC_ALIGN(width, 16);
+	yuv422_afbc_byte_stride  = GRALLOC_ALIGN(width * 2, 16);
+
+	if (size != NULL)
+	{
+		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
+		/* YUV 4:2:2 chroma size equals to luma size */
+		*size = yuv422_afbc_byte_stride * height * 2
+			+ GRALLOC_ALIGN(nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT);
+	}
+
+	if (byte_stride != NULL)
+	{
+		*byte_stride = yuv422_afbc_byte_stride;
+	}
+
+	if (pixel_stride != NULL)
+	{
+		*pixel_stride = yuv422_afbc_pixel_stride;
+	}
+
+	return true;
+}
+
 static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int usage, buffer_handle_t* pHandle, int* pStride)
 {
 
@@ -517,7 +731,8 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	int pixel_stride;  // Stride of the buffer in pixels - as returned in pStride
 	uint64_t internal_format;
 	AllocType type = UNCOMPRESSED;
-	bool alloc_for_extended_yuv;
+	bool alloc_for_extended_yuv = false, alloc_for_arm_afbc_yuv = false;
+	int internalWidth,internalHeight;
 
 #if defined(GRALLOC_FB_SWAP_RED_BLUE)
 	/* match the framebuffer format */
@@ -531,13 +746,23 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	}
 #endif
 
+	/* Some formats require an internal width and height that may be used by
+	 * consumers/producers.
+	 */
+	internalWidth = w;
+	internalHeight = h;
+
 	internal_format = gralloc_select_format(format, usage);
 
-	if (internal_format & (GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK))
+	if (internal_format & (GRALLOC_ARM_INTFMT_AFBC | GRALLOC_ARM_INTFMT_AFBC_SPLITBLK | GRALLOC_ARM_INTFMT_AFBC_WIDEBLK))
 	{
 		if (usage & GRALLOC_USAGE_PRIVATE_2)
 		{
 			type = AFBC_PADDED;
+		}
+		else if (internal_format & GRALLOC_ARM_INTFMT_AFBC_WIDEBLK)
+		{
+			type = AFBC_WIDEBLK;
 		}
 		else
 		{
@@ -546,8 +771,9 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	}
 
 	alloc_for_extended_yuv = (internal_format & GRALLOC_ARM_INTFMT_EXTENDED_YUV) == GRALLOC_ARM_INTFMT_EXTENDED_YUV;
+	alloc_for_arm_afbc_yuv = (internal_format & GRALLOC_ARM_INTFMT_ARM_AFBC_YUV) == GRALLOC_ARM_INTFMT_ARM_AFBC_YUV;
 
-	if (!alloc_for_extended_yuv)
+	if (!alloc_for_extended_yuv && !alloc_for_arm_afbc_yuv)
 	{
 		switch (internal_format & GRALLOC_ARM_INTFMT_FMT_MASK)
 		{
@@ -573,7 +799,7 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 
 			case HAL_PIXEL_FORMAT_YCrCb_420_SP:
 			case HAL_PIXEL_FORMAT_YV12:
-				if (!get_yv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type))
+				if (!get_yv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type, &internalHeight))
 				{
 					return -EINVAL;
 				}
@@ -583,7 +809,6 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 				 * Additional custom formats can be added here
 				 * and must fill the variables pixel_stride, byte_stride and size.
 				 */
-
 			default:
 				return -EINVAL;
 		}
@@ -631,15 +856,32 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 					return -EINVAL;
 				}
 				break;
-			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_AFBC:
-				if (type == AFBC_PADDED)
+				/* 8BIT AFBC YUV 4:2:0 testing usage */
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_8BIT_AFBC:
+				if (!get_afbc_yuv420_8bit_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type, &internalHeight))
 				{
-					AERR("GRALLOC_USAGE_PRIVATE_2 (64byte header row alignment for AFBC) is not supported for YUV");
 					return -EINVAL;
 				}
+				break;
 
+				/* 8BIT AFBC YUV4:2:2 testing usage */
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_8BIT_AFBC:
+				if (!get_afbc_yuv422_8bit_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type))
+				{
+					return -EINVAL;
+				}
+				break;
+
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV420_10BIT_AFBC:
 				/* YUV 4:2:0 compressed */
-				if (false == get_yuv420_afbc_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
+				if (false == get_yuv420_10bit_afbc_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type))
+				{
+					return -EINVAL;
+				}
+				break;
+			case GRALLOC_ARM_HAL_FORMAT_INDEXED_YUV422_10BIT_AFBC:
+				/* YUV 4:2:2 compressed */
+				if (false == get_yuv422_10bit_afbc_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, type))
 				{
 					return -EINVAL;
 				}
@@ -715,6 +957,8 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	hnd->width = w;
 	hnd->height = h;
 	hnd->stride = pixel_stride;
+	hnd->internalWidth = internalWidth;
+	hnd->internalHeight = internalHeight;
 
 	*pStride = pixel_stride;
 	return 0;
