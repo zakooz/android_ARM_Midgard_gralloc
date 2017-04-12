@@ -58,12 +58,12 @@ static int __ump_alloc_should_fail()
 		
 		if (property_get(PROP_MALI_TEST_GRALLOC_FAIL_FIRST, prop_value, "0") > 0)
 		{
-			sscanf(prop_value, "%u", &first_fail);
+			sscanf(prop_value, "%11u", &first_fail);
 		}
 
 		if (property_get(PROP_MALI_TEST_GRALLOC_FAIL_INTERVAL, prop_value, "0") > 0)
 		{
-			sscanf(prop_value, "%u", &fail_period);
+			sscanf(prop_value, "%11u", &fail_period);
 		}
 	}
 
@@ -123,11 +123,13 @@ int alloc_backend_alloc(alloc_device_t* dev, size_t size, int usage, buffer_hand
 					if (UMP_INVALID_SECURE_ID != ump_id)
 					{
 						private_handle_t* hnd = new private_handle_t(private_handle_t::PRIV_FLAGS_USES_UMP,
-						                                             size,
-						                                             (int)cpu_ptr,
-						                                             private_handle_t::LOCK_STATE_MAPPED,
-						                                             ump_id,
-						                                             ump_mem_handle);
+											     usage,
+											     size,
+											     cpu_ptr,
+											     private_handle_t::LOCK_STATE_MAPPED,
+											     ump_id,
+											     ump_mem_handle);
+
 						if (NULL != hnd)
 						{
 							*pHandle = hnd;
@@ -163,31 +165,26 @@ int alloc_backend_alloc(alloc_device_t* dev, size_t size, int usage, buffer_hand
 
 int alloc_backend_alloc_framebuffer(private_module_t* m, private_handle_t* hnd)
 {
-	int retval = -1;
-
 	hnd->ump_id = m->framebuffer->ump_id;
 	/* create a backing ump memory handle if the framebuffer is exposed as a secure ID */
 	if ( (int)UMP_INVALID_SECURE_ID != hnd->ump_id )
 	{
-		hnd->ump_mem_handle = (int)ump_handle_create_from_secure_id( hnd->ump_id );
-		if ( (int)UMP_INVALID_MEMORY_HANDLE == hnd->ump_mem_handle )
+		hnd->ump_mem_handle = ump_handle_create_from_secure_id( hnd->ump_id );
+		if ( UMP_INVALID_MEMORY_HANDLE == hnd->ump_mem_handle )
 		{
-			AINF("warning: unable to create UMP handle from secure ID %i\n", hnd->ump_id);
-		}
-		else
-		{
-			retval = 0;
+			AERR("unable to create UMP handle from secure ID %i\n", hnd->ump_id);
+			return -1;
 		}
 	}
 
-	return retval;
+	return 0;
 }
 
 void alloc_backend_alloc_free(private_handle_t const* hnd, private_module_t* m)
 {
 	if (hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER)
 	{
-		if ( (int)UMP_INVALID_MEMORY_HANDLE != hnd->ump_mem_handle )
+		if ( UMP_INVALID_MEMORY_HANDLE != hnd->ump_mem_handle )
 		{
 			ump_reference_release((ump_handle)hnd->ump_mem_handle);
 		}
@@ -195,7 +192,7 @@ void alloc_backend_alloc_free(private_handle_t const* hnd, private_module_t* m)
 	else if (hnd->flags & private_handle_t::PRIV_FLAGS_USES_UMP)
 	{
 		/* Buffer might be unregistered so we need to check for invalid ump handle*/
-		if ( (int)UMP_INVALID_MEMORY_HANDLE != hnd->ump_mem_handle )
+		if ( UMP_INVALID_MEMORY_HANDLE != hnd->ump_mem_handle )
 		{
 			ump_mapped_pointer_release((ump_handle)hnd->ump_mem_handle);
 			ump_reference_release((ump_handle)hnd->ump_mem_handle);
@@ -203,7 +200,7 @@ void alloc_backend_alloc_free(private_handle_t const* hnd, private_module_t* m)
 	}
 	else if ( hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION )
 	{
-		AERR( "Can't free dma_buf memory for handle:0x%x. Not supported.", (unsigned int)hnd);
+		AERR( "Can't free dma_buf memory for handle:%p. Not supported.", hnd);
 	}
 }
 

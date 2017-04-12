@@ -45,9 +45,13 @@ enum
 
 static int fb_set_swap_interval(struct framebuffer_device_t* dev, int interval)
 {
-	if (interval < dev->minSwapInterval || interval > dev->maxSwapInterval)
+	if (interval < dev->minSwapInterval)
 	{
-		return -EINVAL;
+		interval = dev->minSwapInterval;
+	}
+	else if (interval > dev->maxSwapInterval)
+	{
+		interval = dev->maxSwapInterval;
 	}
 
 	private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
@@ -80,7 +84,7 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
 		m->base.lock(&m->base, buffer, private_module_t::PRIV_USAGE_LOCKED_FOR_POST, 
 				0, 0, m->info.xres, m->info.yres, NULL);
 
-		const size_t offset = hnd->base - m->framebuffer->base;
+		const size_t offset = (uintptr_t)hnd->base - (uintptr_t)m->framebuffer->base;
 		int interrupt;
 		m->info.activate = FB_ACTIVATE_VBL;
 		m->info.yoffset = offset / m->finfo.line_length;
@@ -357,16 +361,14 @@ int init_frame_buffer_locked(struct private_module_t* module)
 
 
 	// Create a "fake" buffer object for the entire frame buffer memory, and store it in the module
-	module->framebuffer = new private_handle_t(private_handle_t::PRIV_FLAGS_FRAMEBUFFER, fbSize, intptr_t(vaddr),
-	                                           0, dup(fd), 0);
+	module->framebuffer = new private_handle_t(private_handle_t::PRIV_FLAGS_FRAMEBUFFER, GRALLOC_USAGE_HW_FB, fbSize, vaddr,
+	                                           0, dup(fd), 0, 0);
 
 	module->numBuffers = info.yres_virtual / info.yres;
 	module->bufferMask = 0;
 	
 #if GRALLOC_ARM_UMP_MODULE
-	#ifdef IOCTL_GET_FB_UMP_SECURE_ID
 	ioctl(fd, IOCTL_GET_FB_UMP_SECURE_ID, &module->framebuffer->ump_id);
-	#endif
 	if ( (int)UMP_INVALID_SECURE_ID != module->framebuffer->ump_id )
 	{
 		AERR("framebuffer accessed with UMP secure ID %i\n", module->framebuffer->ump_id);
@@ -421,6 +423,15 @@ int framebuffer_device_open(hw_module_t const* module, const char* name, hw_devi
 	int status = -EINVAL;
 
 	alloc_device_t* gralloc_device;
+#if DISABLE_FRAMEBUFFER_HAL == 1
+	AERR("Framebuffer HAL not support/disabled %s",
+#if MALI_DISPALY_DP500 == 1
+	"with MALI DP500");
+#else
+	"");
+#endif
+	return -ENODEV;
+#endif
 	status = gralloc_open(module, &gralloc_device);
 	if (status < 0)
 	{
@@ -462,7 +473,7 @@ int framebuffer_device_open(hw_module_t const* module, const char* name, hw_devi
 	const_cast<float&>(dev->xdpi) = m->xdpi;
 	const_cast<float&>(dev->ydpi) = m->ydpi;
 	const_cast<float&>(dev->fps) = m->fps;
-	const_cast<int&>(dev->minSwapInterval) = 1;
+	const_cast<int&>(dev->minSwapInterval) = 0;
 	const_cast<int&>(dev->maxSwapInterval) = 1;
 	*device = &dev->common;
 

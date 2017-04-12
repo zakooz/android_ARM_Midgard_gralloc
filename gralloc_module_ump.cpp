@@ -41,7 +41,7 @@ int gralloc_backend_register(private_handle_t* hnd)
 	case private_handle_t::PRIV_FLAGS_USES_UMP:
 		if (!s_ump_is_open)
 		{
-			ump_result res = ump_open(); // TODO: Fix a ump_close() somewhere???          
+			ump_result res = ump_open(); // MJOLL-4012: UMP implementation needs a ump_close() for each ump_open
 			if (res != UMP_OK)
 			{
 				AERR("Failed to open UMP library with res=%d", res);
@@ -51,10 +51,10 @@ int gralloc_backend_register(private_handle_t* hnd)
 
 		if (s_ump_is_open)
 		{
-			hnd->ump_mem_handle = (int)ump_handle_create_from_secure_id(hnd->ump_id);
+			hnd->ump_mem_handle = ump_handle_create_from_secure_id(hnd->ump_id);
 			if (UMP_INVALID_MEMORY_HANDLE != (ump_handle)hnd->ump_mem_handle)
 			{
-				hnd->base = (int)ump_mapped_pointer_get((ump_handle)hnd->ump_mem_handle);
+				hnd->base = ump_mapped_pointer_get(hnd->ump_mem_handle);
 				if (0 != hnd->base)
 				{
 					hnd->lockState = private_handle_t::LOCK_STATE_MAPPED;
@@ -65,19 +65,19 @@ int gralloc_backend_register(private_handle_t* hnd)
 				}
 				else
 				{
-					AERR("Failed to map UMP handle 0x%x", hnd->ump_mem_handle );
+					AERR("Failed to map UMP handle %p", hnd->ump_mem_handle );
 				}
 
 				ump_reference_release((ump_handle)hnd->ump_mem_handle);
 			}
 			else
 			{
-				AERR("Failed to create UMP handle 0x%x", hnd->ump_mem_handle );
+				AERR("Failed to create UMP handle %p", hnd->ump_mem_handle );
 			}
 		}
 		break;
 	case private_handle_t::PRIV_FLAGS_USES_ION:
-		AERR("Gralloc does not support BMA_BUF. Unable to map memory for handle 0x%x", (unsigned int)hnd );
+		AERR("Gralloc does not support DMA_BUF. Unable to map memory for handle %p", hnd );
 		break;
 	}
 
@@ -93,7 +93,7 @@ void gralloc_backend_unregister(private_handle_t* hnd)
 		ump_mapped_pointer_release((ump_handle)hnd->ump_mem_handle);
 		hnd->base = 0;
 		ump_reference_release((ump_handle)hnd->ump_mem_handle);
-		hnd->ump_mem_handle = (int)UMP_INVALID_MEMORY_HANDLE;
+		hnd->ump_mem_handle = UMP_INVALID_MEMORY_HANDLE;
 		break;
 	case private_handle_t::PRIV_FLAGS_USES_ION:
 		AERR( "Can't unregister DMA_BUF buffer for hnd %p. Not supported", hnd );
@@ -110,7 +110,7 @@ void gralloc_backend_sync(private_handle_t* hnd)
 		ump_cpu_msync_now((ump_handle)hnd->ump_mem_handle, UMP_MSYNC_CLEAN_AND_INVALIDATE, (void*)hnd->base, hnd->size);
 		break;
 	case private_handle_t::PRIV_FLAGS_USES_ION:
-		AERR( "Buffer 0x%x is DMA_BUF type but it is not supported", (unsigned int)hnd );
+		AERR( "Buffer %p is DMA_BUF type but it is not supported", hnd );
 		break;
 	}
 }

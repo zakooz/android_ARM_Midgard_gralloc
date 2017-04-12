@@ -40,7 +40,7 @@ int gralloc_backend_register(private_handle_t* hnd)
 	                      private_handle_t::PRIV_FLAGS_USES_ION))
 	{
 	case private_handle_t::PRIV_FLAGS_USES_UMP:
-		AERR("Gralloc does not support UMP. Unable to register UMP memory for handle 0x%x", (unsigned int)hnd );
+		AERR("Gralloc does not support UMP. Unable to register UMP memory for handle %p", hnd );
 		break;
 	case private_handle_t::PRIV_FLAGS_USES_ION:
 		unsigned char *mappedAddress;
@@ -53,7 +53,7 @@ int gralloc_backend_register(private_handle_t* hnd)
 		}
 		else
 		{
-			AERR("Could not get gralloc module for handle: 0x%x", (unsigned int)hnd);
+			AERR("Could not get gralloc module for handle: %p", hnd);
 			retval = -errno;
 			break;
 		}
@@ -68,7 +68,7 @@ int gralloc_backend_register(private_handle_t* hnd)
 			
 			if (m->ion_client < 0) 
 			{
-				AERR( "Could not open ion device for handle: 0x%x", (unsigned int)hnd );
+				AERR( "Could not open ion device for handle: %p", hnd );
 				retval = -errno;
 				break;
 			}
@@ -84,7 +84,7 @@ int gralloc_backend_register(private_handle_t* hnd)
 			break;
 		}
 		
-		hnd->base = intptr_t(mappedAddress) + hnd->offset;
+		hnd->base = (void*)(uintptr_t(mappedAddress) + hnd->offset);
 		retval = 0;
 		break;
 	}
@@ -98,7 +98,7 @@ void gralloc_backend_unregister(private_handle_t* hnd)
 	                      private_handle_t::PRIV_FLAGS_USES_ION))
 	{
 	case private_handle_t::PRIV_FLAGS_USES_UMP:
-		AERR( "Can't unregister UMP buffer for handle 0x%x. Not supported", (unsigned int)hnd );
+		AERR( "Can't unregister UMP buffer for handle %p. Not supported", hnd );
 		break;
 	case private_handle_t::PRIV_FLAGS_USES_ION:
 		void* base = (void*)hnd->base;
@@ -106,7 +106,7 @@ void gralloc_backend_unregister(private_handle_t* hnd)
 
 		if ( munmap( base,size ) < 0 )
 		{
-			AERR("Could not munmap base:0x%x size:%d '%s'", (unsigned int)base, size, strerror(errno));
+			AERR("Could not munmap base:%p size:%zd '%s'", base, size, strerror(errno));
 		}
 		break;
 	}
@@ -118,7 +118,7 @@ void gralloc_backend_sync(private_handle_t* hnd)
 	                      private_handle_t::PRIV_FLAGS_USES_ION))
 	{
 	case private_handle_t::PRIV_FLAGS_USES_UMP:
-		AERR( "Buffer 0x%x is UMP type but it is not supported", (unsigned int)hnd );
+		AERR( "Buffer %p is UMP type but it is not supported", hnd );
 		break;
 	case private_handle_t::PRIV_FLAGS_USES_ION:
 		hw_module_t * pmodule = NULL;
@@ -130,7 +130,7 @@ void gralloc_backend_sync(private_handle_t* hnd)
 		}
 		else
 		{
-			AERR("Could not get gralloc module for handle 0x%x\n", (unsigned int)hnd);
+			AERR("Could not get gralloc module for handle %p\n", hnd);
 		}
 		break;
 	}

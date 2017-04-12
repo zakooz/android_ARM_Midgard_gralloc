@@ -25,19 +25,30 @@
 #include <linux/fb.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include <hardware/gralloc.h>
 #include <cutils/native_handle.h>
 #include "alloc_device.h"
 #include <utils/Log.h>
 
+#include "format_chooser.h"
+
 #if MALI_ION == 1
 #define GRALLOC_ARM_UMP_MODULE 0
 #define GRALLOC_ARM_DMA_BUF_MODULE 1
+#if !defined(GRALLOC_OLD_ION_API)
+/* new libion */
+typedef int ion_user_handle_t;
+#define ION_INVALID_HANDLE 0
+#else
+typedef struct ion_handle *ion_user_handle_t;
+#define ION_INVALID_HANDLE NULL
+#endif /* GRALLOC_OLD_ION_API */
 #else
 #define GRALLOC_ARM_UMP_MODULE 1
 #define GRALLOC_ARM_DMA_BUF_MODULE 0
-#endif
+#endif /* MALI_ION */
 
 /* NOTE:
  * If your framebuffer device driver is integrated with UMP, you will have to 
@@ -65,7 +76,24 @@ struct fb_dmabuf_export
 #define FBIOGET_DMABUF	_IOR('F', 0x21, struct fb_dmabuf_export)
 #endif
 
+/* the max string size of GRALLOC_HARDWARE_GPU0 & GRALLOC_HARDWARE_FB0
+ * 8 is big enough for "gpu0" & "fb0" currently
+ */
+#define MALI_GRALLOC_HARDWARE_MAX_STR_LEN 8
 #define NUM_FB_BUFFERS 2
+
+/* Define number of shared file descriptors */
+#if MALI_AFBC_GRALLOC == 1 && GRALLOC_ARM_DMA_BUF_MODULE
+#define GRALLOC_ARM_NUM_FDS 2
+#elif MALI_AFBC_GRALLOC == 1 || GRALLOC_ARM_DMA_BUF_MODULE
+#define GRALLOC_ARM_NUM_FDS 1
+#else
+#define GRALLOC_ARM_NUM_FDS 0
+#endif
+
+#define NUM_INTS_IN_PRIVATE_HANDLE ((sizeof(private_handle_t) - sizeof(native_handle)) / sizeof(int) - sNumFds)
+
+
 
 #if GRALLOC_ARM_UMP_MODULE
 #include <ump/ump.h>
@@ -77,14 +105,14 @@ typedef enum
 	MALI_YUV_BT601_NARROW,
 	MALI_YUV_BT601_WIDE,
 	MALI_YUV_BT709_NARROW,
-	MALI_YUV_BT709_WIDE,
+	MALI_YUV_BT709_WIDE
 } mali_gralloc_yuv_info;
 
 typedef enum
 {
 	MALI_DPY_TYPE_UNKNOWN = 0,
 	MALI_DPY_TYPE_CLCD,
-	MALI_DPY_TYPE_HDLCD,
+	MALI_DPY_TYPE_HDLCD
 } mali_dpy_type;
 
 struct private_handle_t;
@@ -132,7 +160,7 @@ struct private_handle_t
 	{
 		PRIV_FLAGS_FRAMEBUFFER = 0x00000001,
 		PRIV_FLAGS_USES_UMP    = 0x00000002,
-		PRIV_FLAGS_USES_ION    = 0x00000004,
+		PRIV_FLAGS_USES_ION    = 0x00000004
 	};
 
 	enum
@@ -150,133 +178,181 @@ struct private_handle_t
 	 * DO NOT MOVE THIS ELEMENT!
 	 */
 	int     share_fd;
-#define GRALLOC_ARM_NUM_FDS 1	
+#endif
+
+#if MALI_AFBC_GRALLOC == 1
+	int     share_attr_fd;
+#endif
+
+#if GRALLOC_ARM_DMA_BUF_MODULE
+	ion_user_handle_t ion_hnd;
 #endif
 
 	// ints
-	int     magic;
-	int     format;
-	int     byte_stride;
-	int     flags;
-	int     size;
-	int     base;
-	int     lockState;
-	int     writeOwner;
-	int     pid;
+	int        magic;
+	int        req_format;
+	uint64_t   internal_format;
+	int        byte_stride;
+	int        flags;
+	int        usage;
+	int        size;
+	int        width;
+	int        height;
+	int        stride;
+	union {
+		void*    base;
+		uint64_t padding;
+	};
+	int        lockState;
+	int        writeOwner;
+	int        pid;
+
+#if MALI_AFBC_GRALLOC == 1
+	// locally mapped shared attribute area
+	union {
+		void*    attr_base;
+		uint64_t padding3;
+	};
+#endif
 
 	mali_gralloc_yuv_info yuv_info;
 
 	// Following members is for framebuffer only
-	int     fd;
-	int     offset;
+	int   fd;
+	union {
+		off_t    offset;
+		uint64_t padding4;
+	};
 
 	// Following members are for UMP memory only
 #if GRALLOC_ARM_UMP_MODULE
-	int     ump_id;
-	int     ump_mem_handle;
-#define GRALLOC_ARM_NUM_INTS 2
-#define GRALLOC_ARM_NUM_FDS 0	
-#else
-	struct ion_handle *ion_hnd;
-#define GRALLOC_ARM_NUM_INTS 2
+	ump_secure_id ump_id;
+	union {
+		void*    ump_mem_handle;
+		uint64_t padding5;
+	};
 #endif
 
 #ifdef __cplusplus
 	/*
-	 * We track the number of integers in the structure. There are 12 unconditional
+	 * We track the number of integers in the structure. There are 16 unconditional
 	 * integers (magic - pid, yuv_info, fd and offset). Note that the fd element is
 	 * considered an int not an fd because it is not intended to be used outside the
 	 * surface flinger process. The GRALLOC_ARM_NUM_INTS variable is used to track the
 	 * number of integers that are conditionally included. Similar considerations apply
 	 * to the number of fds.
 	 */
-	static const int sNumInts = 12 + GRALLOC_ARM_NUM_INTS;
 	static const int sNumFds = GRALLOC_ARM_NUM_FDS;
 	static const int sMagic = 0x3141592;
 
 #if GRALLOC_ARM_UMP_MODULE
-	private_handle_t(int flags, int size, int base, int lock_state, ump_secure_id secure_id, ump_handle handle):
-#if GRALLOC_ARM_DMA_BUF_MODULE
-		share_fd(-1),
+	private_handle_t(int flags, int usage, int size, void *base, int lock_state, ump_secure_id secure_id, ump_handle handle):
+#if MALI_AFBC_GRALLOC == 1
+		share_attr_fd(-1),
 #endif
 		magic(sMagic),
 		flags(flags),
+		usage(usage),
 		size(size),
+		width(0),
+		height(0),
+		stride(0),
 		base(base),
 		lockState(lock_state),
 		writeOwner(0),
 		pid(getpid()),
+#if MALI_AFBC_GRALLOC == 1
+		attr_base(MAP_FAILED),
+#endif
 		yuv_info(MALI_YUV_NO_INFO),
-		ump_id((int)secure_id),
-		ump_mem_handle((int)handle),
-		fd(0),
-		offset(0)
-#if GRALLOC_ARM_DMA_BUF_MODULE
-		,
-		ion_hnd(NULL)
-#endif
-
-	{
-		version = sizeof(native_handle);
-		numFds = sNumFds;
-		numInts = sNumInts;
-	}
-#endif
-
-#if GRALLOC_ARM_DMA_BUF_MODULE
-	private_handle_t(int flags, int size, int base, int lock_state):
-		share_fd(-1),
-		magic(sMagic),
-		flags(flags),
-		size(size),
-		base(base),
-		lockState(lock_state),
-		writeOwner(0),
-		pid(getpid()),
-		yuv_info(MALI_YUV_NO_INFO),
-#if GRALLOC_ARM_UMP_MODULE
-		ump_id((int)UMP_INVALID_SECURE_ID),
-		ump_mem_handle((int)UMP_INVALID_MEMORY_HANDLE),
-#endif
 		fd(0),
 		offset(0),
-		ion_hnd(NULL)
+		ump_id(secure_id),
+		ump_mem_handle(handle)
 
 	{
 		version = sizeof(native_handle);
 		numFds = sNumFds;
-		numInts = sNumInts;
+		numInts = NUM_INTS_IN_PRIVATE_HANDLE;
 	}
-
 #endif
 
-	private_handle_t(int flags, int size, int base, int lock_state, int fb_file, int fb_offset):
+	private_handle_t(int flags, int usage, int size, void *base, int lock_state):
 #if GRALLOC_ARM_DMA_BUF_MODULE
 		share_fd(-1),
 #endif
+#if MALI_AFBC_GRALLOC == 1
+		share_attr_fd(-1),
+#endif
+#if GRALLOC_ARM_DMA_BUF_MODULE
+		ion_hnd(ION_INVALID_HANDLE),
+#endif
 		magic(sMagic),
 		flags(flags),
+		usage(usage),
 		size(size),
+		width(0),
+		height(0),
+		stride(0),
 		base(base),
 		lockState(lock_state),
 		writeOwner(0),
 		pid(getpid()),
-		yuv_info(MALI_YUV_NO_INFO),
-#if GRALLOC_ARM_UMP_MODULE
-		ump_id((int)UMP_INVALID_SECURE_ID),
-		ump_mem_handle((int)UMP_INVALID_MEMORY_HANDLE),
+#if MALI_AFBC_GRALLOC == 1
+		attr_base(MAP_FAILED),
 #endif
+		yuv_info(MALI_YUV_NO_INFO),
+		fd(0),
+		offset(0)
+#if GRALLOC_ARM_UMP_MODULE
+		,ump_id(UMP_INVALID_SECURE_ID),
+		ump_mem_handle(UMP_INVALID_MEMORY_HANDLE)
+#endif
+
+
+	{
+		version = sizeof(native_handle);
+		numFds = sNumFds;
+		numInts = NUM_INTS_IN_PRIVATE_HANDLE;
+	}
+
+	private_handle_t(int flags, int usage, int size, void *base, int lock_state, int fb_file, off_t fb_offset, int unused):
+#if GRALLOC_ARM_DMA_BUF_MODULE
+		share_fd(-1),
+#endif
+#if MALI_AFBC_GRALLOC == 1
+		share_attr_fd(-1),
+#endif
+#if GRALLOC_ARM_DMA_BUF_MODULE
+		ion_hnd(ION_INVALID_HANDLE),
+#endif
+		magic(sMagic),
+		flags(flags),
+		usage(usage),
+		size(size),
+		width(0),
+		height(0),
+		stride(0),
+		base(base),
+		lockState(lock_state),
+		writeOwner(0),
+		pid(getpid()),
+#if MALI_AFBC_GRALLOC == 1
+		attr_base(MAP_FAILED),
+#endif
+		yuv_info(MALI_YUV_NO_INFO),
 		fd(fb_file),
 		offset(fb_offset)
-#if GRALLOC_ARM_DMA_BUF_MODULE
-		,
-		ion_hnd(NULL)
+
+#if GRALLOC_ARM_UMP_MODULE
+		,ump_id(UMP_INVALID_SECURE_ID),
+		ump_mem_handle(UMP_INVALID_MEMORY_HANDLE)
 #endif
 
 	{
 		version = sizeof(native_handle);
 		numFds = sNumFds;
-		numInts = sNumInts;
+		numInts = NUM_INTS_IN_PRIVATE_HANDLE;
 	}
 
 	~private_handle_t()
@@ -292,7 +368,11 @@ struct private_handle_t
 	static int validate(const native_handle* h)
 	{
 		const private_handle_t* hnd = (const private_handle_t*)h;
-		if (!h || h->version != sizeof(native_handle) || h->numInts != sNumInts || h->numFds != sNumFds || hnd->magic != sMagic)
+		if (!h ||
+		    h->version != sizeof(native_handle) ||
+		    h->numInts != NUM_INTS_IN_PRIVATE_HANDLE ||
+		    h->numFds != sNumFds ||
+		    hnd->magic != sMagic)
 		{
 			return -EINVAL;
 		}

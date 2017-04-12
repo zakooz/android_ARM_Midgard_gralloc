@@ -33,6 +33,13 @@
 #include "framebuffer_device.h"
 
 #include "alloc_device_allocator_specific.h"
+#if MALI_AFBC_GRALLOC == 1
+#include "gralloc_buffer_priv.h"
+#endif
+
+#define AFBC_PIXELS_PER_BLOCK                    16
+#define AFBC_BODY_BUFFER_BYTE_ALIGNMENT          1024
+#define AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY  16
 
 static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev, size_t size, int usage, buffer_handle_t* pHandle, int* stride, int* byte_stride)
 {
@@ -77,7 +84,7 @@ static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev, size_t size, in
 		return -ENOMEM;
 	}
 
-	int framebufferVaddr = m->framebuffer->base;
+	uintptr_t framebufferVaddr = (uintptr_t)m->framebuffer->base;
 	// find a free slot
 	for (uint32_t i=0 ; i<numBuffers ; i++)
 	{
@@ -90,8 +97,9 @@ static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev, size_t size, in
 	}
 
 	// The entire framebuffer memory is already mapped, now create a buffer object for parts of this memory
-	private_handle_t* hnd = new private_handle_t(private_handle_t::PRIV_FLAGS_FRAMEBUFFER, size, framebufferVaddr,
-	                                             0, dup(m->framebuffer->fd), framebufferVaddr - m->framebuffer->base);
+	private_handle_t* hnd = new private_handle_t(private_handle_t::PRIV_FLAGS_FRAMEBUFFER, usage, size,
+			(void*)framebufferVaddr, 0, dup(m->framebuffer->fd),
+			(framebufferVaddr - (uintptr_t)m->framebuffer->base), 0);
 
 	/*
 	 * Perform allocator specific actions. If these fail we fall back to a regular buffer
@@ -101,7 +109,7 @@ static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev, size_t size, in
 	{
 		delete hnd;
 		int newUsage = (usage & ~GRALLOC_USAGE_HW_FB) | GRALLOC_USAGE_HW_2D;
-		AERR( "Fallback to single buffering. Unable to map framebuffer memory to handle:0x%x", (unsigned int)hnd );
+		AERR( "Fallback to single buffering. Unable to map framebuffer memory to handle:%p", hnd );
 		*byte_stride = GRALLOC_ALIGN(m->finfo.line_length, 64);
 		return alloc_backend_alloc(dev, alignedFramebufferSize, newUsage, pHandle);
 	}
@@ -131,9 +139,10 @@ static int gralloc_alloc_framebuffer(alloc_device_t* dev, size_t size, int usage
  * pixel_stride (out)  stride of the buffer in pixels
  * byte_stride  (out)  stride of the buffer in bytes
  * size         (out)  size of the buffer in bytes
+ * afbc         (in)   if buffer should be allocated for afbc
  */
 static void get_rgb_stride_and_size(int width, int height, int pixel_size,
-                                    int* pixel_stride, int* byte_stride, size_t* size)
+                                    int* pixel_stride, int* byte_stride, size_t* size, bool afbc)
 {
 	int stride;
 
@@ -157,6 +166,19 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
 	{
 		*pixel_stride = stride / pixel_size;
 	}
+
+	if (afbc)
+	{
+		int w_aligned = GRALLOC_ALIGN( width, AFBC_PIXELS_PER_BLOCK );
+		int h_aligned = GRALLOC_ALIGN( height, AFBC_PIXELS_PER_BLOCK );
+		int nblocks = w_aligned / AFBC_PIXELS_PER_BLOCK * h_aligned / AFBC_PIXELS_PER_BLOCK;
+
+		if ( size != NULL )
+		{
+			*size = w_aligned * h_aligned * pixel_size +
+					GRALLOC_ALIGN( nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT );
+		}
+	}
 }
 
 /*
@@ -168,9 +190,10 @@ static void get_rgb_stride_and_size(int width, int height, int pixel_size,
  * pixel_stride (out)  stride of the buffer in pixels
  * byte_stride  (out)  stride of the buffer in bytes
  * size         (out)  size of the buffer in bytes
+ * afbc         (in)   if buffer should be allocated for afbc
  */
 static bool get_yv12_stride_and_size(int width, int height,
-                                     int* pixel_stride, int* byte_stride, size_t* size)
+                                     int* pixel_stride, int* byte_stride, size_t* size, bool afbc)
 {
 	int luma_stride;
 
@@ -178,6 +201,12 @@ static bool get_yv12_stride_and_size(int width, int height,
 	if (width % 2 != 0 || height % 2 != 0)
 	{
 		return false;
+	}
+
+	if ( afbc && size != NULL )
+	{
+		width = GRALLOC_ALIGN( width, AFBC_PIXELS_PER_BLOCK );
+		height = GRALLOC_ALIGN( height, AFBC_PIXELS_PER_BLOCK );
 	}
 
 	/* Android assumes the buffer should be aligned to 16. */
@@ -200,6 +229,14 @@ static bool get_yv12_stride_and_size(int width, int height,
 		*pixel_stride = luma_stride;
 	}
 
+	if ( afbc && size != NULL )
+	{
+		int nblocks = width / AFBC_PIXELS_PER_BLOCK * height / AFBC_PIXELS_PER_BLOCK;
+
+		/* Just append header block size, width/height alignment done above */
+		*size += GRALLOC_ALIGN( nblocks * AFBC_HEADER_BUFFER_BYTES_PER_BLOCKENTRY, AFBC_BODY_BUFFER_BYTE_ALIGNMENT );
+	}
+
 	return true;
 }
 
@@ -213,27 +250,50 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	size_t size;       // Size to be allocated for the buffer
 	int byte_stride;   // Stride of the buffer in bytes
 	int pixel_stride;  // Stride of the buffer in pixels - as returned in pStride
-	switch (format)
+	uint64_t internal_format;
+	bool alloc_for_afbc=false;
+
+#if defined(GRALLOC_FB_SWAP_RED_BLUE)
+	/* match the framebuffer format */
+	if (usage & GRALLOC_USAGE_HW_FB)
+	{
+#ifdef GRALLOC_16_BITS
+		format = HAL_PIXEL_FORMAT_RGB_565;
+#else
+		format = HAL_PIXEL_FORMAT_BGRA_8888;
+#endif
+	}
+#endif
+
+	internal_format = gralloc_select_format(format, usage);
+
+	alloc_for_afbc = (internal_format & GRALLOC_ARM_INTFMT_AFBC);
+
+	switch (internal_format & GRALLOC_ARM_INTFMT_FMT_MASK)
 	{
 		case HAL_PIXEL_FORMAT_RGBA_8888:
 		case HAL_PIXEL_FORMAT_RGBX_8888:
 		case HAL_PIXEL_FORMAT_BGRA_8888:
-			get_rgb_stride_and_size(w, h, 4, &pixel_stride, &byte_stride, &size);
+#if PLATFORM_SDK_VERSION >= 19
+		case HAL_PIXEL_FORMAT_sRGB_A_8888:
+		case HAL_PIXEL_FORMAT_sRGB_X_8888:
+#endif
+			get_rgb_stride_and_size(w, h, 4, &pixel_stride, &byte_stride, &size, alloc_for_afbc );
 			break;
 		case HAL_PIXEL_FORMAT_RGB_888:
-			get_rgb_stride_and_size(w, h, 3, &pixel_stride, &byte_stride, &size);
+			get_rgb_stride_and_size(w, h, 3, &pixel_stride, &byte_stride, &size, alloc_for_afbc );
 			break;
 		case HAL_PIXEL_FORMAT_RGB_565:
 #if PLATFORM_SDK_VERSION < 19
 		case HAL_PIXEL_FORMAT_RGBA_5551:
 		case HAL_PIXEL_FORMAT_RGBA_4444:
 #endif
-			get_rgb_stride_and_size(w, h, 2, &pixel_stride, &byte_stride, &size);
+			get_rgb_stride_and_size(w, h, 2, &pixel_stride, &byte_stride, &size, alloc_for_afbc );
 			break;
 
 		case HAL_PIXEL_FORMAT_YCrCb_420_SP:
 		case HAL_PIXEL_FORMAT_YV12:
-			if (!get_yv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size))
+			if (!get_yv12_stride_and_size(w, h, &pixel_stride, &byte_stride, &size, alloc_for_afbc))
 			{
 				return -EINVAL;
 			}
@@ -249,12 +309,13 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	}
 
 	int err;
-
+#if DISABLE_FRAMEBUFFER_HAL != 1
 	if (usage & GRALLOC_USAGE_HW_FB)
 	{
 		err = gralloc_alloc_framebuffer(dev, size, usage, pHandle, &pixel_stride, &byte_stride);
 	}
 	else
+#endif
 	{
 		err = alloc_backend_alloc(dev, size, usage, pHandle);
 	}
@@ -265,8 +326,31 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 	}
 
 	private_handle_t *hnd = (private_handle_t *)*pHandle;
-	hnd->format = format;
+
+#if MALI_AFBC_GRALLOC == 1
+	err = gralloc_buffer_attr_allocate( hnd );
+	if( err < 0 )
+	{
+		private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
+
+		if ( (usage & GRALLOC_USAGE_HW_FB) )
+		{
+			/*
+			 * Having the attribute region is not critical for the framebuffer so let it pass.
+			 */
+			err = 0;
+		}
+		else
+		{
+			alloc_backend_alloc_free( hnd, m );
+			return err;
+		}
+	}
+#endif
+
+	hnd->req_format = format;
 	hnd->byte_stride = byte_stride;
+	hnd->internal_format = internal_format;
 
 	int private_usage = usage & (GRALLOC_USAGE_PRIVATE_0 |
 	                             GRALLOC_USAGE_PRIVATE_1);
@@ -285,6 +369,10 @@ static int alloc_device_alloc(alloc_device_t* dev, int w, int h, int format, int
 		hnd->yuv_info = MALI_YUV_BT709_WIDE;
 		break;
 	}
+
+	hnd->width = w;
+	hnd->height = h;
+	hnd->stride = pixel_stride;
 
 	*pStride = pixel_stride;
 	return 0;
@@ -305,11 +393,14 @@ static int alloc_device_free(alloc_device_t* dev, buffer_handle_t handle)
 		// free this buffer
 		private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
 		const size_t bufferSize = m->finfo.line_length * m->info.yres;
-		int index = (hnd->base - m->framebuffer->base) / bufferSize;
+		int index = ((uintptr_t)hnd->base - (uintptr_t)m->framebuffer->base) / bufferSize;
 		m->bufferMask &= ~(1<<index); 
 		close(hnd->fd);
 	}
 
+#if MALI_AFBC_GRALLOC == 1
+	gralloc_buffer_attr_free( (private_handle_t *) hnd );
+#endif
 	alloc_backend_alloc_free(hnd, m);
 
 	delete hnd;
